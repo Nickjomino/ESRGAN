@@ -1,66 +1,42 @@
-import os
-import argparse
-import torch
-from PIL import Image
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from basicsr.archs.srvgg_arch import SRVGGNetCompact
-from realesrgan import RealESRGANer
+import os import argparse import torch import numpy as np from PIL import Image
 
-def load_model(model_path, scale):
-    print(f"Carregando modelo: {model_path}")
-    state_dict = torch.load(model_path, map_location='cpu')
+importa funções de alias e parsing
 
-    if "params" in state_dict and "body.0.weight" in state_dict["params"]:
-        print("Detectado modelo Real-ESRGAN v2 Compact (SRVGGNetCompact)")
-        model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64,
-                                num_conv=32, upscale=scale, act_type='prelu')
-        model.load_state_dict(state_dict["params"], strict=True)
-    elif "model.0.weight" in state_dict:
-        print("Detectado modelo ESRGAN clássico (RRDBNet)")
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
-                        num_block=23, num_grow_ch=32, scale=scale)
-        model.load_state_dict(state_dict, strict=True)
-    else:
-        raise ValueError("Modelo não reconhecido. Estrutura de state_dict não compatível.")
+import helpers from utils.architecture.RRDB import RRDBNet from utils.architecture.SRVGG import SRVGGNetCompact from utils.architecture.SPSR import SPSRNet
 
-    return model
+def build_model(state_dict): """ Constrói a rede correta a partir do state_dict carregado. """ # Real-ESRGAN v2 Compact (SRVGGNetCompact) if 'params' in state_dict and 'body.0.weight' in state_dict['params'].keys(): print("Usando SRVGGNetCompact (Real-ESRGAN v2 Compact)") return SRVGGNetCompact(state_dict) # SPSR (ESRGAN com camadas extras) if 'f_HR_conv1.0.weight' in state_dict.keys(): print("Usando SPSRNet (SPSR)") return SPSRNet(state_dict) # ESRGAN clássico / Real-ESRGAN v1 (RRDBNet) if 'model.0.weight' in state_dict.keys(): print("Usando RRDBNet (ESRGAN clássico)") return RRDBNet(state_dict) raise ValueError("Formato de modelo não reconhecido.")
 
-def upscale(model, device, input_dir, output_dir, scale):
-    upsampler = RealESRGANer(
-        scale=scale,
-        model_path=None,  # já carregamos o modelo manualmente
-        model=model,
-        tile=0,
-        tile_pad=10,
-        pre_pad=0,
-        half=False
-    )
+def process_image(model, device, img: Image.Image): """ Executa inference no PIL Image e retorna PIL Image de saída. """ arr = np.array(img).astype(np.float32) / 255.0 # garante 3 canais if arr.ndim == 2: arr = np.stack([arr]*3, axis=2) # converte HWC->CHW e cria batch tensor = torch.from_numpy(arr.transpose(2,0,1)).unsqueeze(0).to(device).half() with torch.no_grad(): out = model(tensor).float().cpu().clamp_(0,1).numpy()[0] out = (out.transpose(1,2,0) * 255.0).round().astype(np.uint8) return Image.fromarray(out)
 
-    os.makedirs(output_dir, exist_ok=True)
+def main(): parser = argparse.ArgumentParser(description="CLI para upscaling usando ESRGAN-Bot core (sem GUI)") parser.add_argument('--model', '-m', required=True, help="Model string ou alias (ex: 4xPSNR, realesr-general-x4v3)") parser.add_argument('--input', '-i', required=True, help="Pasta com imagens de entrada") parser.add_argument('--output', '-o', required=True, help="Pasta para salvar imagens resultantes") args = parser.parse_args()
 
-    for file in os.listdir(input_dir):
-        if file.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
-            input_path = os.path.join(input_dir, file)
-            output_path = os.path.join(output_dir, file)
+# dispositivo
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-            img = Image.open(input_path).convert("RGB")
-            try:
-                output, _ = upsampler.enhance(img, outscale=scale)
-                output.save(output_path)
-                print(f"Salvo: {output_path}")
-            except Exception as e:
-                print(f"Erro ao processar {file}: {e}")
+# parse_models retorna lista de cadeias (interpolations/chains)
+jobs = helpers.parse_models(args.model, helpers.aliases, helpers.fuzzymodels)
+if not jobs:
+    print(f"Nenhum modelo encontrado para alias '{args.model}'")
+    return
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Caminho para o modelo .pth")
-    parser.add_argument("--scale", type=int, default=2, help="Fator de upscale")
-    parser.add_argument("--input", required=True, help="Pasta com imagens de entrada")
-    parser.add_argument("--output", required=True, help="Pasta para salvar imagens processadas")
-    args = parser.parse_args()
+os.makedirs(args.output, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(args.model, args.scale).to(device)
-    model.eval()
+# processa cada imagem
+for fname in os.listdir(args.input):
+    if not fname.lower().endswith(('.png','.jpg','.jpeg','.bmp','.webp')):
+        continue
+    img = Image.open(os.path.join(args.input, fname)).convert('RGB')
+    result = img
+    # aplica cada estágio da cadeia
+    for stage in jobs[0]:
+        # cada stage: {'model_name': ..., 'state_dict': ...}
+        state_dict = stage['state_dict']
+        net = build_model(state_dict).to(device).eval()
+        result = process_image(net, device, result)
+    # salva
+    out_path = os.path.join(args.output, fname)
+    result.save(out_path)
+    print(f"Salvo: {out_path}")
 
-    upscale(model, device, args.input, args.output, args.scale)
+if name == 'main': main()
+
