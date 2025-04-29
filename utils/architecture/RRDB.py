@@ -252,7 +252,11 @@ class RRDBNet(nn.Module):
                     nbs.append(int(m.group(1)))
             if nbs:
                 break
-        return max(*nbs) + 1
+        if nbs:
+            return max(nbs) + 1
+        else:
+            # assume ao menos 1 bloco como fallback
+            return 1
 
     def forward(self, x):
         if self.shuffle_factor:
